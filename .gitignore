@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.pytest_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+reports/
+_xiaoha_quarantine/
+.xiaoha-cleaner-state/
+server.cfg
+*.local.cfg

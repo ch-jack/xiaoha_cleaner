@@ -1,0 +1,128 @@
+# FiveM 小哈 / HGAdmin 完整清理工具
+
+用于扫描并移除 FiveM 服务器中的小哈/HGAdmin 资源、自动注入守卫、启动配置引用和数据库对象。工具基于 raw dumper 与 decrypted 样本建立识别规则，并内置从 decrypted 样本确认的数据库表清单。
+
+## 主要能力
+
+- 识别 `xiaoha_*`、`xiaoha-*`、`hgadmin*` 以及 manifest 作者/产品特征确认归属的资源。
+- 将确认归属资源移动到目标目录外的隔离目录，而不是直接永久删除。
+- 在其他正常资源中精确移除 `hgadmin_guard.lua`、`hgadmin_guard_sv.lua`、`@hgadmin/shared/anticheat_hookfactory.lua` 和带 `[[HGADMIN-*]]` 标记的 manifest 注入。
+- 注释 `server.cfg` 等配置中的精确 `ensure`、`start`、`restart`、`stop` 与 ACE 引用。
+- 自动读取 `server.cfg`，跟随 `exec *.cfg` 配置链，并安全解析最终生效的 `mysql_connection_string`。
+- 支持 MySQL URI 和 `host=...;user=...;password=...;database=...` 属性格式。
+- 生成并可选择执行全部已确认小哈/HGAdmin 建表、删列和品牌表清理 SQL。
+- 生成 JSON、Markdown、SQL 报告，并支持按 `run-report.json` 完整恢复文件系统修改。
+
+## 下载
+
+从仓库的 [Releases](https://github.com/ch-jack/xiaoha_cleaner/releases) 下载：
+
+- `xiaoha-cleaner-vX.Y.Z-windows.zip`
+- `xiaoha-cleaner-vX.Y.Z-windows.zip.sha256`
+
+解压后运行 `xiaoha-cleaner.cmd`。需要 Windows 和 Python 3.7+；只有执行数据库清理时才需要 MySQL/MariaDB 命令行客户端。
+
+## 使用
+
+先停止 FiveM 服务器。涉及数据库删除时，必须先备份数据库。
+
+```powershell
+# 只读扫描，不修改文件、不连接数据库
+.\xiaoha-cleaner.cmd scan "D:\server-data"
+
+# 隔离资源、清理注入和配置引用，仅生成数据库 SQL
+.\xiaoha-cleaner.cmd clean "D:\server-data" --yes
+
+# 同时从 server.cfg 自动读取 MySQL，并执行删表/删列
+.\xiaoha-cleaner.cmd clean "D:\server-data" --yes `
+  --apply-sql --yes-drop-tables
+```
+
+如果目标目录下存在多个 txAdmin profile，并且连接到不同数据库，工具会拒绝自动选择。此时明确指定配置：
+
+```powershell
+.\xiaoha-cleaner.cmd clean "D:\txData" --yes `
+  --apply-sql --yes-drop-tables `
+  --server-cfg "D:\txData\default\server.cfg"
+```
+
+如果 `mysql.exe` 不在 PATH：
+
+```powershell
+--mysql-command "C:\MariaDB\bin\mysql.exe"
+```
+
+仍可通过 `--mysql-uri` 手动覆盖自动读取结果。连接串只在当前进程内存中使用；密码不会写入报告、终端或 MySQL 命令行参数。
+
+## 支持的 server.cfg 写法
+
+URI：
+
+```cfg
+set mysql_connection_string "mysql://user:password@127.0.0.1:3306/fivem"
+```
+
+属性格式：
+
+```cfg
+set mysql_connection_string "host=127.0.0.1;port=3306;user=root;password=secret;database=fivem"
+```
+
+拆分配置：
+
+```cfg
+exec config/database.cfg
+```
+
+工具按 `server.cfg` 的配置顺序跟随 `exec`，使用最终一次 `mysql_connection_string` 赋值。若引用的是环境变量，仅在该环境变量存在时读取。
+
+## 数据库清理范围
+
+内置样本确认的 14 张表：
+
+```text
+bans
+hgadmin_ac_logs
+hgadmin_ban_videos
+hgadmin_groups
+hgadmin_high_risk_log
+hgadmin_local_bans
+hgadmin_log
+hgadmin_members
+hgadmin_ticket_messages
+hgadmin_tickets
+hgadmin_whitelist
+joint_ban_whitelist
+joint_bans
+warns
+```
+
+还会清理：
+
+- 小哈资源源码中实际解析出的每一个 `CREATE TABLE`。
+- `owned_vehicles.type`、`player_vehicles.type`、`users.last_seen`。
+- 当前数据库内表名包含 `xiaoha` 或 `hgadmin` 的其他基础表。
+
+按项目需求，`bans`、`warns` 也属于有效删除范围；如果其他管理资源共用这些表，删除会同时影响它们。MySQL 不记录共享表中每条数据由哪个 FiveM 资源写入，因此工具不会无条件清空玩家、车辆、职业等核心框架表。
+
+## 文件恢复
+
+清理会在目标目录外创建 `_xiaoha_quarantine`，其中包含原资源、注入文件、被编辑文件备份和运行报告：
+
+```powershell
+.\xiaoha-cleaner.cmd restore `
+  "D:\_xiaoha_quarantine\server-data_YYYYMMDD_HHMMSS\run-report.json" `
+  --yes
+```
+
+数据库 `DROP` 操作无法通过文件报告恢复，只能从执行前的数据库备份恢复。
+
+## 本地验证与打包
+
+```powershell
+python -m py_compile *.py
+python -m unittest discover -s tests -v
+.\tools\Build-Release.ps1 -Version v1.0.0
+```
+
+推送 `v*` 标签后，GitHub Actions 会运行 Python 3.8/3.12 测试，生成版本化 ZIP 和 SHA-256，并自动创建 GitHub Release。

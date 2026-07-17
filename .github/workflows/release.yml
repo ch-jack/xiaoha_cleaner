@@ -1,0 +1,91 @@
+name: test-and-release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xiaoha-cleaner-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.8', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem . -Recurse -Filter *.py |
+            Where-Object { $_.FullName -notmatch '[\\/]dist[\\/]' } |
+            ForEach-Object FullName
+          python -m py_compile @files
+      - name: Unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+  package:
+    name: Build Windows release
+    needs: test
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release archive
+        shell: powershell
+        run: |
+          $version = if ('${{ github.ref_type }}' -eq 'tag') {
+            '${{ github.ref_name }}'
+          } else {
+            (Get-Content .\VERSION -Raw).Trim()
+          }
+          .\tools\Build-Release.ps1 -Version $version
+      - name: Verify release archive
+        shell: powershell
+        run: |
+          $archives = @(Get-ChildItem .\dist -Filter *.zip -File)
+          $checksums = @(Get-ChildItem .\dist -Filter *.sha256 -File)
+          if ($archives.Count -ne 1) { throw "Expected one ZIP, found $($archives.Count)" }
+          if ($checksums.Count -ne 1) { throw "Expected one checksum, found $($checksums.Count)" }
+          $expected = (Get-Content $checksums[0].FullName -Raw).Split(' ')[0].Trim().ToLowerInvariant()
+          $actual = (Get-FileHash $archives[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw 'SHA-256 verification failed' }
+          $stage = Get-ChildItem .\dist -Directory | Select-Object -First 1
+          foreach ($file in @('xiaoha-cleaner.cmd', 'xiaoha-cleaner.py', 'README.md', 'VERSION', 'component-manifest.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage.FullName $file) -PathType Leaf)) {
+              throw "Missing release file: $file"
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xiaoha-cleaner-windows-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

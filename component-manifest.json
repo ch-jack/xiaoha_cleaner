@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "xiaoha_cleaner",
+  "name": "FiveM Xiaoha Cleaner",
+  "version": "v1.0.0",
+  "entry": "xiaoha-cleaner.cmd",
+  "platform": "windows",
+  "python": ">=3.7",
+  "release_asset_pattern": "xiaoha-cleaner-v*-windows.zip",
+  "description": "Detect, quarantine and remove Xiaoha/HGAdmin FiveM resources, injections and owned SQL objects."
+}
