@@ -80,9 +80,13 @@ jobs:
             throw "Stable CMD version mismatch: $reportedVersion"
           }
           $failureOutput = Join-Path $env:RUNNER_TEMP 'xiaoha-release-failed-scan'
+          $oldErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
           & (Join-Path $stage.FullName 'xiaoha-cleaner.cmd') scan (Join-Path $env:RUNNER_TEMP 'missing-xiaoha-target') --output $failureOutput *> $null
-          if ($LASTEXITCODE -ne 1) {
-            throw "Stable CMD failed scan returned $LASTEXITCODE instead of 1"
+          $failedScanExitCode = $LASTEXITCODE
+          $ErrorActionPreference = $oldErrorActionPreference
+          if ($failedScanExitCode -ne 1) {
+            throw "Stable CMD failed scan returned $failedScanExitCode instead of 1"
           }
           $failureReport = Get-Content -LiteralPath (Join-Path $failureOutput 'scan-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
           if ([string]$failureReport.status -ne 'scan-failed' -or -not [bool]$failureReport.terminal) {
