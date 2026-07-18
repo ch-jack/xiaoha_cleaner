@@ -89,3 +89,18 @@ jobs:
             dist/*.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
+      - name: Trigger CK toolbox rebuild
+        if: github.ref_type == 'tag'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.CK_TOOLBOX_TRIGGER_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            Write-Warning 'CK_TOOLBOX_TRIGGER_TOKEN is not configured; toolbox rebuild was not triggered.'
+            exit 0
+          }
+          gh workflow run build-release.yml --repo ch-jack/ck_free_toolbox --ref main -f "source_component=xiaoha_cleaner" -f "source_version=$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to trigger CK toolbox rebuild: $LASTEXITCODE"
+          }
