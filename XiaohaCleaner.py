@@ -174,8 +174,15 @@ DEALLOCATE PREPARE XIAOHA_BRANDED_STMT;
     return sql
 
 
-def markdown_report(plan, status="scan", operations=None, error=None):
-    text = _base_markdown_report(plan, status, operations, error)
+def markdown_report(
+    plan, status="scan", operations=None, error=None,
+    database_execution=None, notices=None,
+    terminal=True, finished_at=None,
+):
+    text = _base_markdown_report(
+        plan, status, operations, error, database_execution, notices,
+        terminal, finished_at,
+    )
     note = (
         "- 已应用 decrypted 样本内置 SQL 表库：{}\n".format(
             "是" if plan["sql"].get("sample_catalog_applied") else "否"

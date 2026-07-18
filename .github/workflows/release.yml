@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.8', '3.12']
+        python-version: ['3.7', '3.8', '3.12']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,6 +46,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
       - name: Build release archive
         shell: powershell
         run: |
@@ -70,6 +73,20 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $stage.FullName $file) -PathType Leaf)) {
               throw "Missing release file: $file"
             }
+          }
+          $expectedVersion = (Get-Content -LiteralPath (Join-Path $stage.FullName 'VERSION') -Raw).Trim().TrimStart('v')
+          $reportedVersion = & (Join-Path $stage.FullName 'xiaoha-cleaner.cmd') --version
+          if ($LASTEXITCODE -ne 0 -or $reportedVersion.Trim() -ne $expectedVersion) {
+            throw "Stable CMD version mismatch: $reportedVersion"
+          }
+          $failureOutput = Join-Path $env:RUNNER_TEMP 'xiaoha-release-failed-scan'
+          & (Join-Path $stage.FullName 'xiaoha-cleaner.cmd') scan (Join-Path $env:RUNNER_TEMP 'missing-xiaoha-target') --output $failureOutput *> $null
+          if ($LASTEXITCODE -ne 1) {
+            throw "Stable CMD failed scan returned $LASTEXITCODE instead of 1"
+          }
+          $failureReport = Get-Content -LiteralPath (Join-Path $failureOutput 'scan-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ([string]$failureReport.status -ne 'scan-failed' -or -not [bool]$failureReport.terminal) {
+            throw 'Stable CMD failed scan report is not a terminal scan-failed result'
           }
       - uses: actions/upload-artifact@v4
         with:

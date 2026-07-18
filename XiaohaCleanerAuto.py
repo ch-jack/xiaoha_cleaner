@@ -328,6 +328,37 @@ def main(argv=None):
             ))
         return core.main(arguments)
     except ConfigError as exc:
+        command = next(
+            (item for item in raw_arguments if item in {"clean", "apply-sql"}),
+            None,
+        )
+        try:
+            if command == "clean":
+                target = command_target(raw_arguments, "clean")
+                if target:
+                    _, quarantine_root = pop_option(
+                        raw_arguments, "--quarantine-root"
+                    )
+                    run_dir, _ = core.write_clean_setup_failure_report(
+                        target, quarantine_root, exc,
+                        include_review="--include-review" in raw_arguments,
+                        database_requested="--apply-sql" in raw_arguments,
+                    )
+                    print("Quarantine/report: {}".format(run_dir))
+            elif command == "apply-sql":
+                sql_file = command_target(raw_arguments, "apply-sql")
+                if sql_file:
+                    report, _, _ = core.write_database_apply_report(
+                        sql_file, "database-failed-config",
+                        error=exc, partial_changes_possible=False,
+                        terminal=True,
+                    )
+                    print("Database report: {}".format(report))
+        except Exception as report_exc:
+            print(
+                "WARNING: failed to write execution report: {}".format(report_exc),
+                file=sys.stderr,
+            )
         print("ERROR: {}".format(exc), file=sys.stderr)
         return 1
 

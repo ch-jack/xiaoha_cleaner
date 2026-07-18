@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "xiaoha_cleaner",
   "name": "FiveM Xiaoha Cleaner",
-  "version": "v1.0.0",
+  "version": "v1.0.1",
   "entry": "xiaoha-cleaner.cmd",
   "platform": "windows",
   "python": ">=3.7",

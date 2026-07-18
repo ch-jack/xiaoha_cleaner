@@ -11,7 +11,8 @@
 - 自动读取 `server.cfg`，跟随 `exec *.cfg` 配置链，并安全解析最终生效的 `mysql_connection_string`。
 - 支持 MySQL URI 和 `host=...;user=...;password=...;database=...` 属性格式。
 - 生成并可选择执行全部已确认小哈/HGAdmin 建表、删列和品牌表清理 SQL。
-- 生成 JSON、Markdown、SQL 报告，并支持按 `run-report.json` 完整恢复文件系统修改。
+- 为扫描、文件清理、数据库清理和恢复分别生成本次执行的 JSON/Markdown 报告，逐项记录实际操作、结果与注意事项。
+- 支持按 `run-report.json` 恢复文件系统修改；恢复会检查清理后的文件是否又被改动，遇到冲突时保留当前文件并写入报告。
 
 ## 下载
 
@@ -117,12 +118,21 @@ warns
 
 数据库 `DROP` 操作无法通过文件报告恢复，只能从执行前的数据库备份恢复。
 
+## 执行报告
+
+- 扫描：`scan-report.json` / `scan-report.md`，明确本次只读发现内容，没有修改文件或数据库。
+- 清理：隔离目录内的 `run-report.json` / `run-report.md`，逐项记录资源隔离、注入移除、配置修改、备份与最终状态。
+- 数据库：清理报告会记录是否请求执行、目标数据库、SQL 哈希与成功/失败结果；SQL 失败时会明确提示数据库可能已经部分变更。独立执行 `apply-sql` 时生成 `database-report.json` / `database-report.md`。
+- 恢复：`restore-report.json` / `restore-report.md`，分别列出恢复成功、冲突与失败项目。
+
+报告中的 `terminal=false` 表示进程尚未形成最终结论，例如 SQL 正在执行或任务被强制停止。报告不会保存 MySQL URI、密码或完整数据库命令行。文件恢复不会撤销数据库 `DROP` / `ALTER`；数据库只能从执行前备份恢复。
+
 ## 本地验证与打包
 
 ```powershell
 python -m py_compile *.py
 python -m unittest discover -s tests -v
-.\tools\Build-Release.ps1 -Version v1.0.0
+.\tools\Build-Release.ps1 -Version v1.0.1
 ```
 
-推送 `v*` 标签后，GitHub Actions 会运行 Python 3.8/3.12 测试，生成版本化 ZIP 和 SHA-256，并自动创建 GitHub Release。
+推送 `v*` 标签后，GitHub Actions 会运行 Python 3.7/3.8/3.12 测试，验证稳定 CMD 的版本与失败退出码，生成版本化 ZIP 和 SHA-256，并自动创建 GitHub Release。

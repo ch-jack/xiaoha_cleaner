@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 MANIFEST_NAMES = ("fxmanifest.lua", "__resource.lua")
 IGNORED_DIR_NAMES = {
@@ -114,6 +114,25 @@ def is_within(child, parent):
         return False
 
 
+def real_path_key(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+
+
+def is_real_within(child, parent):
+    try:
+        return (
+            os.path.commonpath([real_path_key(child), real_path_key(parent)])
+            == real_path_key(parent)
+        )
+    except (ValueError, OSError):
+        return False
+
+
+def is_root_path(path):
+    absolute = Path(path).absolute()
+    return bool(absolute.anchor) and path_key(absolute) == path_key(absolute.anchor)
+
+
 def relative_text(path, root):
     try:
         return str(Path(path).relative_to(Path(root))).replace("\\", "/")
@@ -134,6 +153,46 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def path_snapshot_sha256(path):
+    path = Path(path)
+    digest = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    if not path.is_dir():
+        raise OSError("Path does not exist for hashing: {}".format(path))
+
+    digest.update(b"directory\0")
+    for current_text, dirs, files in os.walk(str(path), topdown=True, followlinks=False):
+        dirs.sort(key=str.lower)
+        files.sort(key=str.lower)
+        current = Path(current_text)
+        for name in dirs:
+            relative = str((current / name).relative_to(path)).replace("\\", "/")
+            digest.update(("D\0" + relative + "\0").encode("utf-8"))
+        for name in files:
+            file_path = current / name
+            relative = str(file_path.relative_to(path)).replace("\\", "/")
+            file_digest = hashlib.sha256()
+            file_size = file_path.stat().st_size
+            with file_path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    file_digest.update(chunk)
+            digest.update((
+                "F\0{}\0{}\0".format(relative, file_size).encode("utf-8")
+            ))
+            digest.update(file_digest.digest())
+    return digest.hexdigest()
+
+
 def decode_bytes(data):
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
@@ -141,6 +200,38 @@ def decode_bytes(data):
         except UnicodeDecodeError:
             pass
     return data.decode("latin-1"), "latin-1"
+
+
+def mysql_secret_values(mysql_uri):
+    values = []
+    if mysql_uri:
+        values.append(str(mysql_uri))
+        try:
+            password = unquote(urlparse(str(mysql_uri)).password or "")
+        except (TypeError, ValueError):
+            password = ""
+        if password:
+            values.append(password)
+    return values
+
+
+def redact_sensitive_text(value, secrets=None):
+    text = str(value or "")
+    secret_values = sorted(
+        {str(item) for item in (secrets or []) if str(item)},
+        key=len, reverse=True,
+    )
+    for secret in secret_values:
+        text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"(?i)\b(mysql|mariadb)://[^\s/@:]+:[^@\s/]*@",
+        r"\1://[REDACTED]@", text,
+    )
+    text = re.sub(
+        r"(?i)\b((?:mysql_)?pwd|password)\s*=\s*[^;\s]+",
+        r"\1=[REDACTED]", text,
+    )
+    return text
 
 
 def read_text_file(path, max_bytes=None):
@@ -772,7 +863,99 @@ def database_cleanup_sql(plan):
     return "\n".join(lines)
 
 
-def markdown_report(plan, status="scan", operations=None, error=None):
+def markdown_value(value):
+    return str(value or "").replace("`", "'")
+
+
+def markdown_operation(operation, index):
+    operation_type = operation.get("type", "unknown")
+    kind = operation.get("kind", "unknown")
+    if operation_type == "move":
+        return "{}. 隔离 `{}` → `{}`（{}）".format(
+            index,
+            markdown_value(operation.get("source")),
+            markdown_value(operation.get("destination")),
+            kind,
+        )
+    if operation_type == "edit":
+        return "{}. 修改 `{}`（{}；备份：`{}`）".format(
+            index,
+            markdown_value(operation.get("path")),
+            kind,
+            markdown_value(operation.get("backup")),
+        )
+    return "{}. {}：`{}`".format(index, operation_type, markdown_value(operation))
+
+
+def default_database_execution(plan, sql_path, status):
+    generated_only = status in {"scan", "cleaned"}
+    return {
+        "requested": False,
+        "status": "generated-only" if generated_only else "not-started",
+        "applied": False,
+        "partial_changes_possible": False,
+        "sql_file": str(Path(sql_path).absolute()),
+        "tables": list(plan["sql"].get("safe_tables", [])),
+        "added_columns": list(plan["sql"].get("added_columns", [])),
+    }
+
+
+def report_notices(status, operations, database_execution):
+    notices = []
+    if status == "scan":
+        notices.append("本次仅扫描并生成报告，没有修改服务器文件或数据库。")
+    elif status == "failed-preflight":
+        notices.append("清理在预检阶段失败，文件修改尚未开始；请处理错误后重新扫描。")
+    elif status == "failed-rolled-back":
+        notices.append("清理过程中发生错误，工具已尝试回滚已记录的文件操作；请结合错误和隔离目录复核实际状态。")
+    elif status == "failed-rollback-incomplete":
+        notices.append("清理失败且自动回滚不完整；部分文件可能仍处于修改或隔离状态，必须按逐项操作和错误人工处理。")
+    elif operations is not None:
+        notices.append("文件修改和隔离路径已逐项记录；需要恢复时请使用本次 run-report.json。")
+
+    database_status = (database_execution or {}).get("status")
+    if database_status == "generated-only":
+        notices.append("cleanup_database.sql 仅已生成、未执行；执行前必须停止服务器并备份数据库。")
+    elif database_status == "pending":
+        notices.append("数据库 SQL 已开始交给客户端执行，但尚无最终结果；请不要把 pending 当作成功。")
+    elif database_status == "failed":
+        notices.append("数据库客户端未成功完成，不能确认 SQL 全部应用；数据库可能已部分变更，请立即核对并准备从备份恢复。")
+    elif database_status == "applied":
+        notices.append("数据库 SQL 已成功执行；文件恢复命令不会恢复数据库，只能使用数据库备份。")
+    elif database_status == "not-started" and status != "scan":
+        notices.append("本次未开始执行数据库 SQL。")
+    if (database_execution or {}).get("marker_error"):
+        notices.append(
+            "数据库已确认执行成功，但本地成功标记写入失败；请以本次 run-report.json 为准。"
+        )
+    return notices
+
+
+def report_phase(status):
+    if status.startswith("scan"):
+        return "scan"
+    if "preflight" in status:
+        return "preflight"
+    if "rollback" in status or status.startswith("restore"):
+        return "rollback"
+    if "database" in status:
+        return "database"
+    return "filesystem"
+
+
+def report_terminal(status):
+    return status not in {
+        "preflight",
+        "filesystem-cleaned-database-not-started",
+        "filesystem-cleaned-database-pending",
+    }
+
+
+def markdown_report(
+    plan, status="scan", operations=None, error=None,
+    database_execution=None, notices=None,
+    terminal=True, finished_at=None,
+):
     summary = plan["summary"]
     lines = [
         "# FiveM 小哈/HGAdmin 清理报告",
@@ -781,6 +964,8 @@ def markdown_report(plan, status="scan", operations=None, error=None):
         "- 目标：`{}`".format(plan["target"]),
         "- 生成时间：{}".format(plan["created_at"]),
         "- 工具版本：{}".format(plan["version"]),
+        "- 报告终态：{}".format("是" if terminal else "否"),
+        "- 完成时间：{}".format(finished_at or "尚未完成"),
         "",
         "## 汇总",
         "",
@@ -840,30 +1025,129 @@ def markdown_report(plan, status="scan", operations=None, error=None):
         lines.append("- 未发现位于保留资源中的外部代码引用。")
 
     if operations is not None:
-        lines.extend(["", "## 已执行文件操作", "", "- {} 项".format(len(operations))])
+        lines.extend(["", "## 已执行文件操作", ""])
+        if operations:
+            for index, operation in enumerate(operations, 1):
+                lines.append("- " + markdown_operation(operation, index))
+        else:
+            lines.append("- 无")
+
+    if database_execution is not None:
+        lines.extend([
+            "",
+            "## 数据库执行结果",
+            "",
+            "- 请求执行：{}".format("是" if database_execution.get("requested") else "否"),
+            "- 状态：`{}`".format(database_execution.get("status", "unknown")),
+            "- 已确认应用：{}".format("是" if database_execution.get("applied") else "否"),
+        ])
+        if database_execution.get("sql_file"):
+            lines.append("- SQL 文件：`{}`".format(
+                markdown_value(database_execution.get("sql_file"))
+            ))
+        if database_execution.get("database"):
+            lines.append("- 数据库：`{}`".format(markdown_value(database_execution["database"])))
+        if database_execution.get("marker"):
+            lines.append("- 成功标记：`{}`".format(markdown_value(database_execution["marker"])))
+        if database_execution.get("marker_status"):
+            lines.append("- 成功标记状态：`{}`".format(
+                markdown_value(database_execution["marker_status"])
+            ))
+        if database_execution.get("marker_error"):
+            lines.append("- 成功标记错误：`{}`".format(
+                markdown_value(database_execution["marker_error"])
+            ))
+        if database_execution.get("error"):
+            lines.append("- 执行错误：`{}`".format(markdown_value(database_execution["error"])))
+
+    if notices:
+        lines.extend(["", "## 注意事项", ""])
+        for notice in notices:
+            lines.append("- {}".format(notice))
     if error:
-        lines.extend(["", "## 错误", "", "```text", str(error), "```"])
+        lines.extend(["", "## 错误", ""])
+        error_lines = str(error).splitlines() or [""]
+        for error_line in error_lines:
+            lines.append("    " + error_line)
     lines.append("")
     return "\n".join(lines)
 
 
-def write_reports(plan, output_dir, status="scan", operations=None, error=None):
+def write_reports(
+    plan, output_dir, status="scan", operations=None, error=None,
+    database_execution=None, notices=None, rewrite_sql=True,
+    operation=None, phase=None, filesystem_partial_changes_possible=False, include_sql=True,
+    terminal=None, rollback=None, secrets=None,
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    sql_path = output_dir / "cleanup_database.sql"
+    if include_sql and (rewrite_sql or not sql_path.is_file()):
+        sql_path.write_bytes(database_cleanup_sql(plan).encode("utf-8"))
+
+    if database_execution is None:
+        database_execution = default_database_execution(plan, sql_path, status)
+    else:
+        database_execution = dict(database_execution)
+        database_execution.setdefault("sql_file", str(sql_path.absolute()))
+        database_execution.setdefault("tables", list(plan["sql"].get("safe_tables", [])))
+        database_execution.setdefault("added_columns", list(plan["sql"].get("added_columns", [])))
+    if database_execution.get("error"):
+        database_execution["error"] = redact_sensitive_text(
+            database_execution["error"], secrets
+        )
+    if database_execution.get("marker_error"):
+        database_execution["marker_error"] = redact_sensitive_text(
+            database_execution["marker_error"], secrets
+        )
+    try:
+        if include_sql:
+            database_execution.setdefault("sql_sha256", sha256_bytes(sql_path.read_bytes()))
+    except OSError:
+        pass
+    database_partial_changes_possible = bool(
+        database_execution.get("partial_changes_possible", False)
+    )
+    database_execution["partial_changes_possible"] = database_partial_changes_possible
+    if notices is None:
+        notices = report_notices(status, operations, database_execution)
+    notices = [redact_sensitive_text(item, secrets) for item in notices]
+    safe_error = redact_sensitive_text(error, secrets)
+
     payload = json_ready(plan)
+    operation = operation or ("scan" if status.startswith("scan") else "clean")
     payload["status"] = status
-    if operations is not None:
-        payload["operations"] = json_ready(operations)
-    if error:
-        payload["error"] = str(error)
-    json_name = "run-report.json" if status != "scan" else "scan-report.json"
-    md_name = "run-report.md" if status != "scan" else "scan-report.md"
+    payload["operation"] = operation
+    payload["phase"] = phase or report_phase(status)
+    updated_at = now_iso()
+    terminal = report_terminal(status) if terminal is None else bool(terminal)
+    payload["report_updated_at"] = updated_at
+    payload["started_at"] = plan.get("created_at") or updated_at
+    payload["terminal"] = terminal
+    payload["finished_at"] = updated_at if terminal else None
+    payload["database_execution"] = json_ready(database_execution)
+    payload["notices"] = list(notices)
+    payload["filesystem_partial_changes_possible"] = bool(
+        filesystem_partial_changes_possible
+    )
+    payload["database_partial_changes_possible"] = database_partial_changes_possible
+    payload["partial_changes_possible"] = bool(
+        filesystem_partial_changes_possible or database_partial_changes_possible
+    )
+    payload["operations"] = json_ready(operations or [])
+    if rollback is not None:
+        payload["rollback"] = json_ready(rollback)
+    if safe_error:
+        payload["error"] = safe_error
+    json_name = "scan-report.json" if operation == "scan" else "run-report.json"
+    md_name = "scan-report.md" if operation == "scan" else "run-report.md"
     json_path = output_dir / json_name
     md_path = output_dir / md_name
     json_path.write_bytes((json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-    md_path.write_bytes(markdown_report(plan, status, operations, error).encode("utf-8"))
-    sql_path = output_dir / "cleanup_database.sql"
-    sql_path.write_bytes(database_cleanup_sql(plan).encode("utf-8"))
+    md_path.write_bytes(markdown_report(
+        plan, status, operations, safe_error, database_execution, notices,
+        terminal, payload["finished_at"],
+    ).encode("utf-8"))
     return json_path, md_path, sql_path
 
 
@@ -908,14 +1192,21 @@ def backup_and_edit(edit, target, run_dir, operations):
     relative = Path(relative_text(path, target))
     backup = run_dir / "backups" / relative
     backup.parent.mkdir(parents=True, exist_ok=True)
+    before_sha256 = path_snapshot_sha256(path)
     shutil.copy2(str(path), str(backup))
-    path.write_bytes(edit["_new_bytes"])
-    operations.append({
+    operation = {
         "type": "edit",
         "kind": edit["kind"],
         "path": str(path),
         "backup": str(backup),
-    })
+        "before_sha256": before_sha256,
+        "backup_sha256": path_snapshot_sha256(backup),
+        "completed": False,
+    }
+    operations.append(operation)
+    path.write_bytes(edit["_new_bytes"])
+    operation["after_sha256"] = path_snapshot_sha256(path)
+    operation["completed"] = True
 
 
 def move_to_quarantine(source, target, destination_root, kind, operations):
@@ -925,55 +1216,138 @@ def move_to_quarantine(source, target, destination_root, kind, operations):
     relative = Path(relative_text(source, target))
     destination = destination_root / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
+    content_sha256 = path_snapshot_sha256(source)
     if destination.exists():
         raise RuntimeError("Quarantine destination already exists: {}".format(destination))
-    shutil.move(str(source), str(destination))
-    operations.append({
+    operation = {
         "type": "move",
         "kind": kind,
         "source": str(source),
         "destination": str(destination),
-    })
+        "content_sha256": content_sha256,
+        "completed": False,
+    }
+    operations.append(operation)
+    shutil.move(str(source), str(destination))
+    operation["completed"] = True
 
 
-def rollback_operations(operations):
+class RestoreConflictError(RuntimeError):
+    pass
+
+
+class ExecutionReportError(RuntimeError):
+    def __init__(self, message, report_path=None, report_dir=None):
+        RuntimeError.__init__(self, message)
+        self.report_path = str(report_path or "")
+        self.report_dir = str(report_dir or "")
+
+
+def rollback_operations(operations, include_results=False):
     errors = []
+    results = []
     for operation in reversed(operations):
+        result = {"operation": json_ready(operation), "status": "restored"}
         try:
             if operation["type"] == "edit":
                 backup = Path(operation["backup"])
                 path = Path(operation["path"])
+                expected_backup = operation.get("backup_sha256")
+                if expected_backup and (
+                    not backup.is_file() or path_snapshot_sha256(backup) != expected_backup
+                ):
+                    raise RestoreConflictError(
+                        "Backup changed after clean: {}".format(backup)
+                    )
+                expected_after = operation.get("after_sha256")
+                if expected_after and (
+                    not path.is_file() or path_snapshot_sha256(path) != expected_after
+                ):
+                    raise RestoreConflictError(
+                        "Edited file changed after clean: {}".format(path)
+                    )
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(backup), str(path))
             elif operation["type"] == "move":
                 source = Path(operation["source"])
                 destination = Path(operation["destination"])
+                if (
+                    operation.get("completed") is False
+                    and source.exists()
+                    and not destination.exists()
+                ):
+                    result["status"] = "not-applied"
+                    results.append(result)
+                    continue
                 if source.exists():
-                    raise RuntimeError("Restore target already exists: {}".format(source))
+                    raise RestoreConflictError(
+                        "Restore target already exists: {}".format(source)
+                    )
+                if not destination.exists():
+                    raise RuntimeError(
+                        "Quarantined content is missing: {}".format(destination)
+                    )
+                expected_content = operation.get("content_sha256")
+                if expected_content and (
+                    not destination.exists()
+                    or path_snapshot_sha256(destination) != expected_content
+                ):
+                    raise RestoreConflictError(
+                        "Quarantined content changed after clean: {}".format(destination)
+                    )
                 source.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(destination), str(source))
+            else:
+                raise RuntimeError("Unknown operation type: {}".format(operation.get("type")))
         except Exception as exc:  # rollback must attempt every operation
-            errors.append("{}: {}".format(operation, exc))
+            message = "{}: {}".format(operation, exc)
+            errors.append(message)
+            result["status"] = (
+                "conflict" if isinstance(exc, RestoreConflictError) else "failed"
+            )
+            result["error"] = str(exc)
+        results.append(result)
+    if include_results:
+        return errors, results
     return errors
 
 
-def clean_target(plan, quarantine_root=None):
+def clean_target(plan, quarantine_root=None, database_execution=None):
     target = Path(plan["target"]).absolute()
+    database_execution = dict(database_execution or {}) or None
+    database_requested = bool(
+        database_execution and database_execution.get("requested")
+    )
     if quarantine_root is None:
         quarantine_root = target.parent / "_xiaoha_quarantine"
     else:
         quarantine_root = Path(quarantine_root).absolute()
-    if is_within(quarantine_root, target):
+    if is_within(quarantine_root, target) or is_real_within(quarantine_root, target):
         raise ValueError("Quarantine directory must be outside the target directory")
 
     run_dir = unique_run_dir(
         quarantine_root / "{}_{}".format(target.name or "server", now_stamp())
     )
     run_dir.mkdir(parents=True, exist_ok=False)
-    write_reports(plan, run_dir, status="preflight", operations=[])
-    verify_edit_preconditions(plan)
-
     operations = []
+    write_reports(
+        plan, run_dir, status="preflight", operations=[],
+        database_execution=database_execution,
+    )
+    try:
+        verify_edit_preconditions(plan)
+    except Exception as exc:
+        detail = "{}".format(exc)
+        report_paths = write_reports(
+            plan, run_dir, status="failed-preflight", operations=[],
+            error=detail, rewrite_sql=False,
+            database_execution=database_execution,
+            filesystem_partial_changes_possible=False,
+        )
+        raise ExecutionReportError(
+            detail, report_path=report_paths[0], report_dir=run_dir
+        )
+
     try:
         for item in plan["resources"]["owned"]:
             move_to_quarantine(
@@ -990,57 +1364,286 @@ def clean_target(plan, quarantine_root=None):
                 path = Path(edit["path"])
                 if path.exists():
                     backup_and_edit(edit, target, run_dir, operations)
-        report_paths = write_reports(plan, run_dir, status="cleaned", operations=operations)
+        success_status = (
+            "filesystem-cleaned-database-not-started"
+            if database_requested else "cleaned"
+        )
+        report_paths = write_reports(
+            plan, run_dir, status=success_status, operations=operations,
+            rewrite_sql=False, filesystem_partial_changes_possible=False,
+            database_execution=database_execution,
+        )
         return run_dir, operations, report_paths
     except Exception as exc:
-        rollback_errors = rollback_operations(operations)
+        rollback_errors, rollback_results = rollback_operations(
+            operations, include_results=True
+        )
         detail = "{}".format(exc)
         if rollback_errors:
             detail += "\nRollback errors:\n- " + "\n- ".join(rollback_errors)
-        write_reports(plan, run_dir, status="failed-rolled-back", operations=operations, error=detail)
-        raise RuntimeError(detail)
+        failure_status = (
+            "failed-rollback-incomplete" if rollback_errors else "failed-rolled-back"
+        )
+        rollback = {
+            "attempted": True,
+            "operation_results": rollback_results,
+            "successful_operations": len([
+                item for item in rollback_results
+                if item.get("status") in {"restored", "not-applied"}
+            ]),
+            "failed_operations": len([
+                item for item in rollback_results
+                if item.get("status") == "failed"
+            ]),
+            "conflict_operations": len([
+                item for item in rollback_results
+                if item.get("status") == "conflict"
+            ]),
+            "pending_restore_operations": [
+                item.get("operation") for item in rollback_results
+                if item.get("status") in {"failed", "conflict"}
+            ],
+            "errors": rollback_errors,
+        }
+        report_paths = write_reports(
+            plan, run_dir, status=failure_status, operations=operations,
+            error=detail, rewrite_sql=False,
+            database_execution=database_execution, rollback=rollback,
+            filesystem_partial_changes_possible=bool(rollback_errors),
+        )
+        raise ExecutionReportError(
+            detail, report_path=report_paths[0], report_dir=run_dir
+        )
 
 
 def validate_restore_operation(operation, target, run_dir):
+    if not isinstance(operation, dict):
+        raise RuntimeError("Invalid operation entry in report")
     if operation["type"] == "edit":
-        if not is_within(operation["path"], target):
+        path = Path(operation["path"])
+        backup = Path(operation["backup"])
+        if not path.is_absolute() or not backup.is_absolute():
+            raise RuntimeError("Restore paths must be absolute")
+        if not is_within(path, target) or not is_real_within(path, target):
             raise RuntimeError("Invalid edit path in report: {}".format(operation["path"]))
-        if not is_within(operation["backup"], run_dir):
+        if not is_within(backup, run_dir) or not is_real_within(backup, run_dir):
             raise RuntimeError("Invalid backup path in report: {}".format(operation["backup"]))
     elif operation["type"] == "move":
-        if not is_within(operation["source"], target):
+        source = Path(operation["source"])
+        destination = Path(operation["destination"])
+        if not source.is_absolute() or not destination.is_absolute():
+            raise RuntimeError("Restore paths must be absolute")
+        source_boundary = source if source.exists() else source.parent
+        if (
+            not is_within(source, target)
+            or not is_real_within(source_boundary, target)
+        ):
             raise RuntimeError("Invalid source path in report: {}".format(operation["source"]))
-        if not is_within(operation["destination"], run_dir):
+        if (
+            not is_within(destination, run_dir)
+            or not is_real_within(destination, run_dir)
+        ):
             raise RuntimeError("Invalid quarantine path in report: {}".format(operation["destination"]))
     else:
         raise RuntimeError("Unknown operation type: {}".format(operation.get("type")))
 
 
+def restore_markdown_report(result):
+    lines = [
+        "# FiveM 小哈/HGAdmin 文件恢复报告",
+        "",
+        "- 状态：`{}`".format(result.get("status", "unknown")),
+        "- 源报告：`{}`".format(markdown_value(result.get("source_report"))),
+        "- 目标：`{}`".format(markdown_value(result.get("target"))),
+        "- 完成时间：{}".format(result.get("restored_at", "")),
+        "",
+        "## 恢复操作",
+        "",
+    ]
+    operation_results = result.get("operation_results") or []
+    if operation_results:
+        for index, item in enumerate(operation_results, 1):
+            operation = item.get("operation") or {}
+            lines.append("- {} — `{}`".format(
+                markdown_operation(operation, index), item.get("status", "unknown")
+            ))
+            if item.get("error"):
+                lines.append("  - 错误：{}".format(item["error"]))
+    else:
+        lines.append("- 无")
+
+    if result.get("errors"):
+        lines.extend(["", "## 错误", ""])
+        for error in result["errors"]:
+            lines.append("- {}".format(error))
+    lines.extend(["", "## 注意事项", ""])
+    for notice in result.get("notices") or []:
+        lines.append("- {}".format(notice))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_restore_reports(run_dir, result):
+    run_dir = Path(run_dir)
+    restore_path = run_dir / "restore-report.json"
+    markdown_path = run_dir / "restore-report.md"
+    result["reports"] = {
+        "json": str(restore_path.absolute()),
+        "markdown": str(markdown_path.absolute()),
+    }
+    restore_path.write_bytes((json.dumps(result, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    markdown_path.write_bytes(restore_markdown_report(result).encode("utf-8"))
+    return restore_path, markdown_path
+
+
 def restore_report(report_path):
     report_path = Path(report_path).absolute()
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
-    target = Path(payload["target"]).absolute()
     run_dir = report_path.parent.absolute()
-    operations = payload.get("operations") or []
-    if not operations:
-        raise RuntimeError("Report contains no completed operations: {}".format(report_path))
-    for operation in operations:
-        validate_restore_operation(operation, target, run_dir)
-    errors = rollback_operations(operations)
+    target = ""
+    operations = []
+    try:
+        if report_path.name.lower() != "run-report.json":
+            raise RuntimeError("Restore requires a run-report.json file")
+        if is_root_path(run_dir):
+            raise RuntimeError("Restore report directory cannot be a filesystem root")
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        if payload.get("tool") != "fivem-xiaoha-cleaner":
+            raise RuntimeError("Report was not created by fivem-xiaoha-cleaner")
+        if not payload.get("version"):
+            raise RuntimeError("Report is missing its tool version")
+        if payload.get("operation") not in (None, "clean"):
+            raise RuntimeError("Only clean execution reports can be restored")
+        allowed_statuses = {
+            "cleaned",
+            "filesystem-cleaned-database-not-started",
+            "filesystem-cleaned-database-pending",
+            "filesystem-cleaned-database-failed",
+            "cleaned-database-applied",
+            "failed-rollback-incomplete",
+        }
+        if payload.get("status") not in allowed_statuses:
+            raise RuntimeError(
+                "Report status is not restorable: {}".format(payload.get("status"))
+            )
+        raw_target = Path(payload["target"])
+        if not raw_target.is_absolute():
+            raise RuntimeError("Report target must be an absolute path")
+        target = raw_target.absolute()
+        if is_root_path(target) or not target.is_dir():
+            raise RuntimeError("Report target must be an existing non-root directory")
+        if is_within(run_dir, target) or is_real_within(run_dir, target):
+            raise RuntimeError("Restore report directory must be outside the target")
+        operations = payload.get("operations")
+        if payload.get("status") == "failed-rollback-incomplete":
+            rollback = payload.get("rollback") or {}
+            pending_operations = rollback.get("pending_restore_operations")
+            if isinstance(pending_operations, list):
+                operations = pending_operations
+        if not isinstance(operations, list) or not operations:
+            raise RuntimeError("Report contains no completed operations: {}".format(report_path))
+        for operation in operations:
+            validate_restore_operation(operation, target, run_dir)
+    except Exception as exc:
+        message = "{}".format(exc)
+        finished_at = now_iso()
+        result = {
+            "tool": "fivem-xiaoha-cleaner",
+            "version": VERSION,
+            "status": "restore-failed-validation",
+            "operation": "restore",
+            "phase": "validation",
+            "restored_at": finished_at,
+            "report_updated_at": finished_at,
+            "terminal": True,
+            "finished_at": finished_at,
+            "source_report": str(report_path),
+            "target": str(target),
+            "operations": len(operations) if isinstance(operations, list) else 0,
+            "operation_results": [],
+            "successful_operations": 0,
+            "failed_operations": 0,
+            "conflict_operations": 0,
+            "errors": [message],
+            "error": message,
+            "filesystem_partial_changes_possible": False,
+            "database_partial_changes_possible": False,
+            "partial_changes_possible": False,
+            "database_execution": {
+                "requested": False,
+                "status": "not-applicable",
+                "applied": False,
+                "partial_changes_possible": False,
+            },
+            "notices": [
+                "恢复报告校验失败，尚未开始修改文件。",
+                "文件恢复命令不会恢复数据库 DROP/ALTER 操作。",
+            ],
+            "database_note": "Database DROP operations are not reversible by this restore command.",
+        }
+        restore_path, _ = write_restore_reports(run_dir, result)
+        raise ExecutionReportError(
+            message, report_path=restore_path, report_dir=run_dir
+        )
+
+    errors, operation_results = rollback_operations(operations, include_results=True)
+    failed_operations = len([
+        item for item in operation_results if item.get("status") == "failed"
+    ])
+    conflict_operations = len([
+        item for item in operation_results if item.get("status") == "conflict"
+    ])
+    status = "restored"
+    if failed_operations:
+        status = "restore-failed"
+    elif conflict_operations:
+        status = "restore-conflict"
+    finished_at = now_iso()
     result = {
         "tool": "fivem-xiaoha-cleaner",
         "version": VERSION,
-        "restored_at": now_iso(),
+        "status": status,
+        "operation": "restore",
+        "phase": "rollback",
+        "restored_at": finished_at,
+        "report_updated_at": finished_at,
+        "terminal": True,
+        "finished_at": finished_at,
         "source_report": str(report_path),
         "target": str(target),
         "operations": len(operations),
+        "operation_results": operation_results,
+        "successful_operations": (
+            len(operation_results) - failed_operations - conflict_operations
+        ),
+        "failed_operations": failed_operations,
+        "conflict_operations": conflict_operations,
         "errors": errors,
+        "filesystem_partial_changes_possible": bool(errors),
+        "database_partial_changes_possible": False,
+        "partial_changes_possible": bool(errors),
+        "database_execution": {
+            "requested": False,
+            "status": "not-applicable",
+            "applied": False,
+            "partial_changes_possible": False,
+        },
+        "notices": [
+            "恢复操作仅覆盖 run-report.json 中记录的文件修改。",
+            "文件恢复命令不会恢复数据库 DROP/ALTER 操作。",
+        ],
         "database_note": "Database DROP operations are not reversible by this restore command.",
     }
-    restore_path = run_dir / "restore-report.json"
-    restore_path.write_bytes((json.dumps(result, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
     if errors:
-        raise RuntimeError("Restore completed with errors:\n- " + "\n- ".join(errors))
+        result["error"] = "Restore completed with errors:\n- " + "\n- ".join(errors)
+        result["notices"].insert(
+            0, "部分文件恢复失败；请根据逐项结果处理冲突并复核服务器目录。"
+        )
+    restore_path, _ = write_restore_reports(run_dir, result)
+    if errors:
+        raise ExecutionReportError(
+            "Restore completed with errors:\n- " + "\n- ".join(errors),
+            report_path=restore_path, report_dir=run_dir,
+        )
     return restore_path, result
 
 
@@ -1088,15 +1691,235 @@ def apply_sql_file(sql_path, mysql_uri, mysql_command="mysql"):
         )
     if completed.returncode != 0:
         stderr = decode_bytes(completed.stderr)[0].strip()
+        stderr = redact_sensitive_text(
+            stderr, [mysql_uri, connection.get("password", "")]
+        )
         raise RuntimeError("MySQL cleanup failed (exit {}): {}".format(
             completed.returncode, stderr
         ))
     return decode_bytes(completed.stdout)[0]
 
 
+def database_report_markdown(payload):
+    database = payload["database_execution"]
+    lines = [
+        "# FiveM 小哈/HGAdmin 数据库 SQL 执行报告",
+        "",
+        "- 状态：`{}`".format(payload["status"]),
+        "- SQL 文件：`{}`".format(markdown_value(database.get("sql_file"))),
+        "- 数据库：`{}`".format(markdown_value(database.get("database"))),
+        "- 已确认应用：{}".format("是" if database.get("applied") else "否"),
+        "- 报告终态：{}".format("是" if payload["terminal"] else "否"),
+        "- 开始时间：{}".format(payload["started_at"]),
+        "- 完成时间：{}".format(payload.get("finished_at") or "尚未完成"),
+        "",
+        "## 注意事项",
+        "",
+    ]
+    for notice in payload["notices"]:
+        lines.append("- {}".format(notice))
+    if payload.get("error"):
+        lines.extend(["", "## 错误", ""])
+        for error_line in str(payload["error"]).splitlines() or [""]:
+            lines.append("    " + error_line)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_database_apply_report(
+    sql_file, status, database="", error=None, partial_changes_possible=False,
+    terminal=True, started_at=None, report_dir=None, secrets=None,
+):
+    sql_path = Path(sql_file).absolute()
+    if report_dir is None:
+        base = (
+            sql_path.parent if sql_path.parent.is_dir()
+            else Path(__file__).absolute().parent / "reports" / "database"
+        )
+        report_dir = unique_run_dir(base / ("database-report_" + now_stamp()))
+        report_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        report_dir = Path(report_dir).absolute()
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+    sql_sha256 = ""
+    try:
+        sql_sha256 = sha256_bytes(sql_path.read_bytes())
+    except OSError:
+        pass
+    safe_error = redact_sensitive_text(error, secrets)
+    updated_at = now_iso()
+    database_execution = {
+        "requested": True,
+        "status": status.replace("database-", ""),
+        "applied": status == "database-applied",
+        "partial_changes_possible": bool(partial_changes_possible),
+        "sql_file": str(sql_path),
+        "sql_sha256": sql_sha256,
+        "database": database,
+    }
+    if safe_error:
+        database_execution["error"] = safe_error
+    notices = []
+    if status == "database-pending":
+        notices.append("SQL 已交给数据库客户端执行，当前报告不是最终结论。")
+    elif status == "database-applied":
+        notices.append("SQL 已成功执行；数据库变更只能从数据库备份恢复。")
+    elif partial_changes_possible:
+        notices.append("数据库客户端未成功完成，数据库可能已部分变更；请立即核对并准备从备份恢复。")
+    else:
+        notices.append("数据库执行在校验阶段失败，尚未开始执行 SQL。")
+    payload = {
+        "tool": "fivem-xiaoha-cleaner",
+        "version": VERSION,
+        "operation": "apply-sql",
+        "phase": "database",
+        "status": status,
+        "started_at": started_at or updated_at,
+        "report_updated_at": updated_at,
+        "terminal": bool(terminal),
+        "finished_at": updated_at if terminal else None,
+        "operations": [{
+            "type": "database-sql",
+            "sql_file": str(sql_path),
+            "sql_sha256": sql_sha256,
+            "status": database_execution["status"],
+        }],
+        "database_execution": database_execution,
+        "filesystem_partial_changes_possible": False,
+        "database_partial_changes_possible": bool(partial_changes_possible),
+        "partial_changes_possible": bool(partial_changes_possible),
+        "notices": notices,
+    }
+    if safe_error:
+        payload["error"] = safe_error
+    json_path = report_dir / "database-report.json"
+    markdown_path = report_dir / "database-report.md"
+    payload["reports"] = {
+        "json": str(json_path.absolute()),
+        "markdown": str(markdown_path.absolute()),
+    }
+    json_path.write_bytes((json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    markdown_path.write_bytes(database_report_markdown(payload).encode("utf-8"))
+    return json_path, markdown_path, report_dir
+
+
 def default_scan_dir(target):
     script_dir = Path(__file__).absolute().parent
     return script_dir / "reports" / "scan_{}_{}".format(Path(target).name, now_stamp())
+
+
+def empty_failure_plan(target, include_review=False):
+    return {
+        "tool": "fivem-xiaoha-cleaner",
+        "version": VERSION,
+        "created_at": now_iso(),
+        "target": str(Path(target).absolute()),
+        "include_review": bool(include_review),
+        "resources": {
+            "all_count": 0,
+            "owned": [],
+            "review": [],
+        },
+        "injection_files": [],
+        "edits": {
+            "manifests": [],
+            "configs": [],
+            "sql_files": [],
+            "manual_manifests": [],
+        },
+        "sql": {
+            "safe_tables": [],
+            "review_tables": [],
+            "created_tables": [],
+            "added_columns": [],
+            "sample_catalog_applied": False,
+            "scanned_files": 0,
+        },
+        "external_references": [],
+        "external_references_truncated": False,
+        "summary": {
+            "owned_resources": 0,
+            "review_resources": 0,
+            "resource_files": 0,
+            "resource_lua_files": 0,
+            "resource_bytes": 0,
+            "injection_files": 0,
+            "manifest_edits": 0,
+            "config_edits": 0,
+            "external_sql_edits": 0,
+            "safe_sql_tables": 0,
+            "review_sql_tables": 0,
+            "external_references": 0,
+            "added_sql_columns": 0,
+        },
+    }
+
+
+def write_scan_failure_report(target, output_dir, error, include_review=False):
+    plan = empty_failure_plan(target, include_review)
+    database_execution = {
+        "requested": False,
+        "status": "not-started",
+        "applied": False,
+        "partial_changes_possible": False,
+        "sql_file": "",
+        "tables": [],
+        "added_columns": [],
+    }
+    return write_reports(
+        plan, output_dir, status="scan-failed", operation="scan", phase="scan",
+        operations=[], error=str(error), database_execution=database_execution,
+        notices=[
+            "扫描失败，没有修改服务器文件或数据库。",
+            "本次没有生成可执行的 cleanup_database.sql；请先处理错误并重新扫描。",
+        ],
+        include_sql=False, filesystem_partial_changes_possible=False,
+    )
+
+
+def write_clean_setup_failure_report(
+    target, quarantine_root, error, include_review=False, database_requested=False,
+    database_name="", secrets=None,
+):
+    target = Path(target).absolute()
+    requested_root = Path(quarantine_root).absolute() if quarantine_root else None
+    if is_root_path(target):
+        report_root = Path(__file__).absolute().parent / "reports" / "failed-clean"
+    elif (
+        requested_root
+        and not is_within(requested_root, target)
+        and not is_real_within(requested_root, target)
+    ):
+        report_root = requested_root
+    else:
+        report_root = target.parent / "_xiaoha_quarantine"
+    run_dir = unique_run_dir(
+        report_root / "{}_{}".format(target.name or "server", now_stamp())
+    )
+    run_dir.mkdir(parents=True, exist_ok=False)
+    plan = empty_failure_plan(target, include_review)
+    database_execution = {
+        "requested": bool(database_requested),
+        "status": "not-started",
+        "applied": False,
+        "partial_changes_possible": False,
+        "sql_file": "",
+        "database": database_name,
+        "tables": [],
+        "added_columns": [],
+    }
+    reports = write_reports(
+        plan, run_dir, status="failed-setup", operation="clean", phase="setup",
+        operations=[], error=str(error), database_execution=database_execution,
+        notices=[
+            "清理在参数、环境或扫描准备阶段失败，尚未修改文件或数据库。",
+            "请处理报告中的错误后重新执行。",
+        ],
+        include_sql=False, filesystem_partial_changes_possible=False,
+        secrets=secrets,
+    )
+    return run_dir, reports
 
 
 def print_summary(plan):
@@ -1158,9 +1981,19 @@ def main(argv=None):
         return 2
     try:
         if args.command == "scan":
-            plan = build_plan(args.target, include_review=args.include_review)
             output = Path(args.output).absolute() if args.output else default_scan_dir(args.target)
-            reports = write_reports(plan, output, status="scan")
+            try:
+                plan = build_plan(args.target, include_review=args.include_review)
+            except Exception as exc:
+                reports = write_scan_failure_report(
+                    args.target, output, exc, args.include_review
+                )
+                print("JSON report: {}".format(reports[0]))
+                print("Markdown report: {}".format(reports[1]))
+                raise
+            reports = write_reports(
+                plan, output, status="scan", operation="scan", operations=[]
+            )
             print_summary(plan)
             print("JSON report: {}".format(reports[0]))
             print("Markdown report: {}".format(reports[1]))
@@ -1170,57 +2003,258 @@ def main(argv=None):
         if args.command == "clean":
             if not args.yes:
                 print("Refusing to modify files without --yes. Running a read-only scan instead.")
-                plan = build_plan(args.target, include_review=args.include_review)
-                reports = write_reports(plan, default_scan_dir(args.target), status="scan")
+                output = default_scan_dir(args.target)
+                try:
+                    plan = build_plan(args.target, include_review=args.include_review)
+                except Exception as exc:
+                    reports = write_scan_failure_report(
+                        args.target, output, exc, args.include_review
+                    )
+                    print("Scan report: {}".format(reports[0]))
+                    raise
+                reports = write_reports(
+                    plan, output, status="scan", operation="scan", operations=[]
+                )
                 print_summary(plan)
                 print("Scan report: {}".format(reports[0]))
                 return 2
-            if args.apply_sql:
-                if not args.yes_drop_tables or not args.mysql_uri:
-                    raise ValueError(
-                        "--apply-sql requires --yes-drop-tables and --mysql-uri"
+            database_name = ""
+            database_secrets = mysql_secret_values(args.mysql_uri)
+            initial_database_execution = None
+            try:
+                target_path = Path(args.target).absolute()
+                if args.quarantine_root and (
+                    is_within(Path(args.quarantine_root).absolute(), target_path)
+                    or is_real_within(
+                        Path(args.quarantine_root).absolute(), target_path
                     )
-                if shutil.which(args.mysql_command) is None and not Path(args.mysql_command).is_file():
-                    raise RuntimeError("MySQL client was not found: {}".format(args.mysql_command))
-                parse_mysql_uri(args.mysql_uri)
-            plan = build_plan(args.target, include_review=args.include_review)
+                ):
+                    raise ValueError(
+                        "Quarantine directory must be outside the target directory"
+                    )
+                if args.apply_sql:
+                    if not args.yes_drop_tables or not args.mysql_uri:
+                        raise ValueError(
+                            "--apply-sql requires --yes-drop-tables and --mysql-uri"
+                        )
+                    if (
+                        shutil.which(args.mysql_command) is None
+                        and not Path(args.mysql_command).is_file()
+                    ):
+                        raise RuntimeError(
+                            "MySQL client was not found: {}".format(args.mysql_command)
+                        )
+                    database_name = parse_mysql_uri(args.mysql_uri)["database"]
+                    initial_database_execution = {
+                        "requested": True,
+                        "status": "not-started",
+                        "applied": False,
+                        "partial_changes_possible": False,
+                        "database": database_name,
+                    }
+                plan = build_plan(args.target, include_review=args.include_review)
+            except Exception as exc:
+                detail = redact_sensitive_text(exc, database_secrets)
+                run_dir, reports = write_clean_setup_failure_report(
+                    args.target, args.quarantine_root, detail, args.include_review,
+                    args.apply_sql, database_name, database_secrets,
+                )
+                print("Quarantine/report: {}".format(run_dir))
+                raise RuntimeError(detail)
             print_summary(plan)
-            run_dir, operations, reports = clean_target(plan, args.quarantine_root)
+            try:
+                run_dir, operations, reports = clean_target(
+                    plan, args.quarantine_root, initial_database_execution
+                )
+            except ExecutionReportError as exc:
+                if exc.report_dir:
+                    print("Quarantine/report: {}".format(exc.report_dir))
+                raise
             print("Cleaned with {} reversible filesystem operations.".format(len(operations)))
             print("Quarantine/report: {}".format(run_dir))
             if args.apply_sql:
-                apply_sql_file(reports[2], args.mysql_uri, args.mysql_command)
                 marker = run_dir / "database-cleanup-applied.json"
-                marker.write_bytes((json.dumps({
-                    "applied_at": now_iso(),
+                sql_sha256 = sha256_bytes(Path(reports[2]).read_bytes())
+                database_execution = {
+                    "requested": True,
+                    "status": "pending",
+                    "applied": False,
+                    "partial_changes_possible": True,
                     "sql_file": str(reports[2]),
-                    "database": parse_mysql_uri(args.mysql_uri)["database"],
-                    "tables": plan["sql"]["safe_tables"],
+                    "sql_sha256": sql_sha256,
+                    "database": database_name,
+                    "tables": list(plan["sql"].get("safe_tables", [])),
+                    "added_columns": list(plan["sql"].get("added_columns", [])),
+                }
+                reports = write_reports(
+                    plan, run_dir,
+                    status="filesystem-cleaned-database-pending",
+                    operation="clean", phase="database",
+                    operations=operations,
+                    database_execution=database_execution,
+                    rewrite_sql=False,
+                    filesystem_partial_changes_possible=False,
+                    secrets=database_secrets,
+                )
+                try:
+                    apply_sql_file(reports[2], args.mysql_uri, args.mysql_command)
+                except Exception as exc:
+                    detail = redact_sensitive_text(exc, database_secrets)
+                    database_execution.update({
+                        "status": "failed",
+                        "applied": False,
+                        "partial_changes_possible": True,
+                        "error": detail,
+                    })
+                    write_reports(
+                        plan, run_dir,
+                        status="filesystem-cleaned-database-failed",
+                        operation="clean", phase="database",
+                        operations=operations, error=detail,
+                        database_execution=database_execution,
+                        rewrite_sql=False,
+                        filesystem_partial_changes_possible=False,
+                        secrets=database_secrets,
+                    )
+                    raise RuntimeError(detail)
+
+                applied_at = now_iso()
+                database_execution.update({
+                    "status": "applied",
+                    "applied": True,
+                    "partial_changes_possible": False,
+                    "applied_at": applied_at,
+                    "marker_status": "not-written",
+                })
+                reports = write_reports(
+                    plan, run_dir, status="cleaned-database-applied",
+                    operation="clean", phase="database",
+                    operations=operations,
+                    database_execution=database_execution,
+                    rewrite_sql=False,
+                    filesystem_partial_changes_possible=False,
+                    secrets=database_secrets,
+                )
+                marker_payload = {
+                    "status": "applied",
+                    "applied_at": applied_at,
+                    "sql_file": str(reports[2]),
+                    "sql_sha256": sql_sha256,
+                    "database": database_name,
+                    "tables": list(plan["sql"].get("safe_tables", [])),
+                    "added_columns": list(plan["sql"].get("added_columns", [])),
+                    "partial_changes_possible": False,
                     "warning": "Database changes are not restored by the filesystem restore command.",
-                }, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-                print("Database cleanup applied. Marker: {}".format(marker))
+                }
+                try:
+                    marker.write_bytes((
+                        json.dumps(marker_payload, ensure_ascii=False, indent=2) + "\n"
+                    ).encode("utf-8"))
+                except Exception as exc:
+                    marker_error = redact_sensitive_text(exc, database_secrets)
+                    database_execution.update({
+                        "marker_status": "failed",
+                        "marker_error": marker_error,
+                    })
+                    print(
+                        "WARNING: database cleanup succeeded but the local marker could not be written: {}".format(
+                            marker_error
+                        ),
+                        file=sys.stderr,
+                    )
+                else:
+                    database_execution.update({
+                        "marker_status": "written",
+                        "marker": str(marker),
+                    })
+                reports = write_reports(
+                    plan, run_dir, status="cleaned-database-applied",
+                    operation="clean", phase="database",
+                    operations=operations,
+                    database_execution=database_execution,
+                    rewrite_sql=False,
+                    filesystem_partial_changes_possible=False,
+                    secrets=database_secrets,
+                )
+                if database_execution["marker_status"] == "written":
+                    print("Database cleanup applied. Marker: {}".format(marker))
+                else:
+                    print("Database cleanup applied; see run-report.json for marker details.")
             return 0
 
         if args.command == "restore":
             if not args.yes:
                 raise ValueError("restore requires --yes")
-            restore_path, result = restore_report(args.report)
+            try:
+                restore_path, result = restore_report(args.report)
+            except ExecutionReportError as exc:
+                if exc.report_path:
+                    print("Restore report: {}".format(exc.report_path))
+                raise
             print("Restored {} filesystem operations.".format(result["operations"]))
             print("Restore report: {}".format(restore_path))
             print("Note: database DROP operations require a database backup to restore.")
             return 0
 
         if args.command == "apply-sql":
-            if not args.yes_drop_tables:
-                raise ValueError("apply-sql requires --yes-drop-tables")
-            apply_sql_file(args.sql_file, args.mysql_uri, args.mysql_command)
+            started_at = now_iso()
+            database_name = ""
+            database_secrets = mysql_secret_values(args.mysql_uri)
+            try:
+                if not args.yes_drop_tables:
+                    raise ValueError("apply-sql requires --yes-drop-tables")
+                sql_path = Path(args.sql_file).absolute()
+                if not sql_path.is_file():
+                    raise ValueError("SQL file does not exist: {}".format(sql_path))
+                database_name = parse_mysql_uri(args.mysql_uri)["database"]
+                if (
+                    shutil.which(args.mysql_command) is None
+                    and not Path(args.mysql_command).is_file()
+                ):
+                    raise RuntimeError(
+                        "MySQL client was not found: {}".format(args.mysql_command)
+                    )
+            except Exception as exc:
+                detail = redact_sensitive_text(exc, database_secrets)
+                database_report, _, _ = write_database_apply_report(
+                    args.sql_file, "database-failed-validation",
+                    database=database_name, error=detail,
+                    partial_changes_possible=False, terminal=True,
+                    started_at=started_at, secrets=database_secrets,
+                )
+                print("Database report: {}".format(database_report))
+                raise RuntimeError(detail)
+            database_report, _, report_dir = write_database_apply_report(
+                args.sql_file, "database-pending", database=database_name,
+                partial_changes_possible=True, terminal=False,
+                started_at=started_at, secrets=database_secrets,
+            )
+            print("Database report: {}".format(database_report))
+            try:
+                apply_sql_file(args.sql_file, args.mysql_uri, args.mysql_command)
+            except Exception as exc:
+                detail = redact_sensitive_text(exc, database_secrets)
+                write_database_apply_report(
+                    args.sql_file, "database-failed", database=database_name,
+                    error=detail, partial_changes_possible=True, terminal=True,
+                    started_at=started_at, report_dir=report_dir,
+                    secrets=database_secrets,
+                )
+                raise RuntimeError(detail)
+            database_report, _, _ = write_database_apply_report(
+                args.sql_file, "database-applied", database=database_name,
+                partial_changes_possible=False, terminal=True,
+                started_at=started_at, report_dir=report_dir,
+                secrets=database_secrets,
+            )
             print("Database cleanup applied from {}".format(Path(args.sql_file).absolute()))
+            print("Database report: {}".format(database_report))
             return 0
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print("ERROR: {}".format(exc), file=sys.stderr)
+        print("ERROR: {}".format(redact_sensitive_text(exc)), file=sys.stderr)
         if os.environ.get("XIAOHA_CLEANER_DEBUG") == "1":
             traceback.print_exc()
         return 1

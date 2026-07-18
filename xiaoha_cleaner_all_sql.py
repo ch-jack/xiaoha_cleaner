@@ -136,8 +136,15 @@ def database_cleanup_sql(plan):
     return "\n".join(lines)
 
 
-def markdown_report(plan, status="scan", operations=None, error=None):
-    text = _base_markdown_report(plan, status, operations, error)
+def markdown_report(
+    plan, status="scan", operations=None, error=None,
+    database_execution=None, notices=None,
+    terminal=True, finished_at=None,
+):
+    text = _base_markdown_report(
+        plan, status, operations, error, database_execution, notices,
+        terminal, finished_at,
+    )
     text = text.replace("可安全清理数据库表", "将删除的数据库表")
     text = text.replace("自动清理范围", "自动删除（资源内 CREATE TABLE 或明确归属）")
     text = text.replace(
