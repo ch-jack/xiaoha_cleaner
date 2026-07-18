@@ -92,6 +92,7 @@ jobs:
           if ([string]$failureReport.status -ne 'scan-failed' -or -not [bool]$failureReport.terminal) {
             throw 'Stable CMD failed scan report is not a terminal scan-failed result'
           }
+          $global:LASTEXITCODE = 0
       - uses: actions/upload-artifact@v4
         with:
           name: xiaoha-cleaner-windows-${{ github.sha }}
