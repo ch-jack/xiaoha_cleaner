@@ -24,11 +24,80 @@ import xiaoha_cleaner as core
 
 APP_NAME = "秒杀小哈"
 CREATE_NO_WINDOW = 0x08000000
+BASE_DPI = 96.0
 REPORT_PATTERNS = {
     "scan": re.compile(r"(?im)^JSON report:\s*(.+?)\s*$"),
     "clean": re.compile(r"(?im)^Quarantine/report:\s*(.+?)\s*$"),
     "restore": re.compile(r"(?im)^Restore report:\s*(.+?)\s*$"),
 }
+
+
+def enable_high_dpi_awareness():
+    """Enable crisp per-monitor rendering before the first Tk window exists."""
+    if os.name != "nt":
+        return "not-windows"
+    try:
+        import ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        setter = user32.SetProcessDpiAwarenessContext
+        setter.argtypes = [ctypes.c_void_p]
+        setter.restype = ctypes.c_bool
+        if setter(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+        if ctypes.get_last_error() == 5:
+            return "manifest-or-existing"
+    except (AttributeError, OSError):
+        pass
+    try:
+        import ctypes
+        shcore = ctypes.WinDLL("shcore")
+        setter = shcore.SetProcessDpiAwareness
+        setter.argtypes = [ctypes.c_int]
+        setter.restype = ctypes.c_long
+        result = int(setter(2))
+        if result == 0:
+            return "per-monitor"
+        if result in (-2147024891, 0x80070005):
+            return "manifest-or-existing"
+    except (AttributeError, OSError):
+        pass
+    try:
+        import ctypes
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except (AttributeError, OSError):
+        pass
+    return "unavailable"
+
+
+def tk_scaling_for_dpi(dpi):
+    return max(0.75, min(4.0, float(dpi) / 72.0))
+
+
+def logical_pixels(value, dpi):
+    return max(1, int(round(float(value) * float(dpi) / BASE_DPI)))
+
+
+def window_dpi(root):
+    if os.name == "nt":
+        try:
+            import ctypes
+            user32 = ctypes.WinDLL("user32")
+            getter = user32.GetDpiForWindow
+            getter.argtypes = [ctypes.c_void_p]
+            getter.restype = ctypes.c_uint
+            dpi = int(getter(ctypes.c_void_p(root.winfo_id())))
+            if dpi > 0:
+                return dpi
+        except (AttributeError, OSError):
+            pass
+    try:
+        dpi = int(round(float(root.winfo_fpixels("1i"))))
+        if dpi > 0:
+            return dpi
+    except Exception:
+        pass
+    return int(BASE_DPI)
 
 
 def application_directory():
@@ -114,6 +183,7 @@ class CleanerWindow(object):
         self.filedialog = filedialog
         self.messagebox = messagebox
         self.root = root
+        self.dpi = window_dpi(root)
         self.process = None
         self.events = queue.Queue()
         self.output_lines = []
@@ -140,13 +210,22 @@ class CleanerWindow(object):
 
     def _configure_window(self):
         self.root.title("{} v{}".format(APP_NAME, core.VERSION))
-        self.root.geometry("940x720")
-        self.root.minsize(820, 640)
         self.root.configure(background="#0e1117")
         try:
-            self.root.tk.call("tk", "scaling", 1.15)
+            self.root.tk.call("tk", "scaling", tk_scaling_for_dpi(self.dpi))
         except Exception:
             pass
+        width = logical_pixels(940, self.dpi)
+        height = logical_pixels(720, self.dpi)
+        max_width = max(640, int(self.root.winfo_screenwidth()) - logical_pixels(40, self.dpi))
+        max_height = max(520, int(self.root.winfo_screenheight()) - logical_pixels(80, self.dpi))
+        width = min(width, max_width)
+        height = min(height, max_height)
+        self.root.geometry("{}x{}".format(width, height))
+        self.root.minsize(
+            min(logical_pixels(820, self.dpi), width),
+            min(logical_pixels(640, self.dpi), height),
+        )
 
         style = self.ttk.Style(self.root)
         try:
@@ -574,13 +653,18 @@ class CleanerWindow(object):
 def smoke_test():
     """Construct the GUI without showing it; used by release CI."""
     try:
+        awareness = enable_high_dpi_awareness()
         import tkinter as tk
         root = tk.Tk()
         root.withdraw()
-        CleanerWindow(root)
+        window = CleanerWindow(root)
         root.update_idletasks()
         root.destroy()
-        print("GUI smoke test passed: {} {}".format(APP_NAME, core.VERSION))
+        print(
+            "GUI smoke test passed: {} {} dpi={} awareness={}".format(
+                APP_NAME, core.VERSION, window.dpi, awareness
+            )
+        )
         return 0
     except Exception as exc:
         print("GUI smoke test failed: {}".format(exc), file=sys.stderr)
@@ -588,6 +672,7 @@ def smoke_test():
 
 
 def main():
+    enable_high_dpi_awareness()
     import tkinter as tk
     try:
         root = tk.Tk()

@@ -10,6 +10,20 @@ import xiaoha_cleaner as core
 
 
 class GuiContractTest(unittest.TestCase):
+    def test_executable_build_embeds_per_monitor_v2_manifest(self):
+        build_script = (
+            Path(__file__).absolute().parent.parent / "tools" / "Build-Executable.ps1"
+        ).read_text(encoding="utf-8-sig")
+        self.assertIn("PerMonitorV2, PerMonitor", build_script)
+        self.assertIn("--manifest", build_script)
+
+    def test_dpi_math_matches_windows_display_scaling(self):
+        self.assertEqual(gui.logical_pixels(940, 96), 940)
+        self.assertEqual(gui.logical_pixels(940, 144), 1410)
+        self.assertEqual(gui.logical_pixels(720, 192), 1440)
+        self.assertAlmostEqual(gui.tk_scaling_for_dpi(96), 96.0 / 72.0)
+        self.assertAlmostEqual(gui.tk_scaling_for_dpi(144), 2.0)
+
     def test_console_encoding_configuration_is_safe_without_reconfigure(self):
         class MinimalStream(object):
             pass

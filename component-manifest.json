@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "xiaoha_cleaner",
   "name": "秒杀小哈",
-  "version": "v1.1.0",
+  "version": "v1.1.1",
   "entry": "xiaoha-cleaner.exe",
   "fallback_entry": "xiaoha-cleaner.cmd",
   "platform": "windows",

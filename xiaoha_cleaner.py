@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 MANIFEST_NAMES = ("fxmanifest.lua", "__resource.lua")
 IGNORED_DIR_NAMES = {

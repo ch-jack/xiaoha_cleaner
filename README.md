@@ -25,6 +25,8 @@
 
 普通用户直接运行 EXE，不需要安装 Python。兼容包解压后也可运行 `xiaoha-cleaner.exe`；源码入口 `xiaoha-cleaner.cmd` 仍需要 Python 3.7+。只有执行数据库清理时才需要 MySQL/MariaDB 命令行客户端。
 
+EXE 支持 Windows Per-Monitor DPI Aware V2，在 125%、150% 和 200% 显示缩放下按显示器 DPI 原生渲染文字，不使用整窗位图拉伸。
+
 ## 使用
 
 双击 `xiaoha-cleaner.exe` 会打开“秒杀小哈”图形界面。先停止 FiveM 服务器；涉及数据库删除时，必须先备份数据库。
@@ -137,8 +139,9 @@ warns
 python -m py_compile *.py
 python -m unittest discover -s tests -v
 python -m pip install -r requirements-build.txt
-$exe = .\tools\Build-Executable.ps1 -Version v1.1.0 | ConvertFrom-Json
-.\tools\Build-Release.ps1 -Version v1.1.0 -ExecutablePath $exe.executable
+$version = (Get-Content .\VERSION -Raw).Trim()
+$exe = .\tools\Build-Executable.ps1 -Version $version | ConvertFrom-Json
+.\tools\Build-Release.ps1 -Version $version -ExecutablePath $exe.executable
 ```
 
 推送 `v*` 标签后，GitHub Actions 会运行 Python 3.7/3.8/3.12 测试，以固定版本 PyInstaller 生成 Windows x64 单文件 EXE，验证 GUI、CLI、失败报告和 SHA-256，再发布 EXE、兼容 ZIP 及各自校验文件。
