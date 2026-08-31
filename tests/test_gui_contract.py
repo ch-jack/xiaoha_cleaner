@@ -10,6 +10,25 @@ import xiaoha_cleaner as core
 
 
 class GuiContractTest(unittest.TestCase):
+    def test_console_encoding_configuration_is_safe_without_reconfigure(self):
+        class MinimalStream(object):
+            pass
+
+        original_stdout = gui.sys.stdout
+        original_stderr = gui.sys.stderr
+        try:
+            gui.sys.stdout = MinimalStream()
+            gui.sys.stderr = MinimalStream()
+            import importlib.util
+            launcher_path = Path(__file__).absolute().parent.parent / "xiaoha-cleaner.py"
+            spec = importlib.util.spec_from_file_location("xiaoha_public_launcher", str(launcher_path))
+            launcher = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(launcher)
+            launcher.configure_console_encoding()
+        finally:
+            gui.sys.stdout = original_stdout
+            gui.sys.stderr = original_stderr
+
     def test_source_and_frozen_cli_commands_preserve_arguments(self):
         arguments = ["scan", r"D:\FiveM Server\resources", "--output", r"D:\报告"]
         source = gui.cli_command(

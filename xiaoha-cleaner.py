@@ -10,6 +10,21 @@ import sys
 from XiaohaCleanerAuto import main as cli_main
 
 
+def configure_console_encoding():
+    """Use UTF-8 for redirected output and Windows consoles on every locale."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def hide_console_window():
     """Hide the PyInstaller console only when the no-argument GUI is used."""
     if os.name != "nt" or not getattr(sys, "frozen", False):
@@ -24,6 +39,7 @@ def hide_console_window():
 
 
 def main(argv=None):
+    configure_console_encoding()
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ["--gui-smoke-test"]:
         from XiaohaCleanerGui import smoke_test
