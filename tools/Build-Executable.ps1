@@ -32,6 +32,45 @@ function Assert-ChildPath {
     return $fullPath
 }
 
+function Invoke-PyInstallerBuild {
+    param(
+        [string]$Python,
+        [string]$WorkingDirectory,
+        [string[]]$Arguments
+    )
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Python
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Arguments = ($Arguments | ForEach-Object {
+        $value = [string]$_
+        if ($value.Contains('"')) { throw "Unsupported quote in build argument: $value" }
+        '"' + $value + '"'
+    }) -join ' '
+
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $psi
+    try {
+        if (-not $process.Start()) { throw 'Failed to start PyInstaller.' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdoutTask.Wait()
+        $stderrTask.Wait()
+        $stdout = $stdoutTask.Result.TrimEnd()
+        $stderr = $stderrTask.Result.TrimEnd()
+        if ($stdout) { Write-Host $stdout }
+        if ($stderr) { Write-Host $stderr }
+        return [int]$process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
+}
+
 $assetName = "xiaoha-cleaner-$Version-windows-x64.exe"
 $asset = Join-Path $output $assetName
 $checksum = "$asset.sha256"
@@ -83,19 +122,25 @@ VSVersionInfo(
 try {
     Push-Location $root
     try {
-        & $PythonCommand -m PyInstaller `
-            --noconfirm `
-            --clean `
-            --onefile `
-            --console `
-            --name 'xiaoha-cleaner' `
-            --version-file $versionInfo `
-            --distpath $pyInstallerDist `
-            --workpath $pyInstallerWork `
-            --specpath $pyInstallerSpec `
-            (Join-Path $root 'xiaoha-cleaner.py') 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            throw "PyInstaller exited with code $LASTEXITCODE"
+        $pyInstallerArguments = @(
+            '-m', 'PyInstaller',
+            '--noconfirm',
+            '--clean',
+            '--onefile',
+            '--console',
+            '--name', 'xiaoha-cleaner',
+            '--version-file', $versionInfo,
+            '--distpath', $pyInstallerDist,
+            '--workpath', $pyInstallerWork,
+            '--specpath', $pyInstallerSpec,
+            (Join-Path $root 'xiaoha-cleaner.py')
+        )
+        $pyInstallerExitCode = Invoke-PyInstallerBuild `
+            -Python $PythonCommand `
+            -WorkingDirectory $root `
+            -Arguments $pyInstallerArguments
+        if ($pyInstallerExitCode -ne 0) {
+            throw "PyInstaller exited with code $pyInstallerExitCode"
         }
     } finally {
         Pop-Location
