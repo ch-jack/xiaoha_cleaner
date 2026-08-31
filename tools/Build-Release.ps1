@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Version = '',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [string]$ExecutablePath = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -40,6 +41,7 @@ $releaseFiles = @(
     'XiaohaCleaner.py',
     'XiaohaCleanerFinal.py',
     'XiaohaCleanerAuto.py',
+    'XiaohaCleanerGui.py',
     'README.md',
     'SECURITY.md',
     'CHANGELOG.md',
@@ -54,6 +56,15 @@ foreach ($file in $releaseFiles) {
     }
     Copy-Item -LiteralPath $source -Destination (Join-Path $stage $file)
 }
+
+if (-not $ExecutablePath) {
+    $ExecutablePath = Join-Path $output "xiaoha-cleaner-$Version-windows-x64.exe"
+}
+$ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
+if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
+    throw "Missing standalone executable: $ExecutablePath"
+}
+Copy-Item -LiteralPath $ExecutablePath -Destination (Join-Path $stage 'xiaoha-cleaner.exe')
 
 [IO.File]::WriteAllText(
     (Join-Path $stage 'VERSION'),
@@ -74,7 +85,8 @@ $forbidden = Get-ChildItem -LiteralPath $stage -Recurse -Force | Where-Object {
     $_.Name -like '*.sql' -or
     $_.Name -like '*scan-report*' -or
     $_.Name -like '*run-report*' -or
-    $_.Name -like '*.zip'
+    $_.Name -like '*.zip' -or
+    ($_.PSIsContainer -and $_.Name -in @('build', 'dist'))
 }
 if ($forbidden) {
     throw "Forbidden release content: $($forbidden.FullName -join ', ')"

@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 MANIFEST_NAMES = ("fxmanifest.lua", "__resource.lua")
 IGNORED_DIR_NAMES = {
@@ -1734,7 +1734,7 @@ def write_database_apply_report(
     if report_dir is None:
         base = (
             sql_path.parent if sql_path.parent.is_dir()
-            else Path(__file__).absolute().parent / "reports" / "database"
+            else default_report_root() / "database"
         )
         report_dir = unique_run_dir(base / ("database-report_" + now_stamp()))
         report_dir.mkdir(parents=True, exist_ok=False)
@@ -1804,9 +1804,18 @@ def write_database_apply_report(
     return json_path, markdown_path, report_dir
 
 
+def default_report_root():
+    """Return a persistent writable report root for scripts and frozen builds."""
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        base = Path(local_app_data)
+    else:
+        base = Path.home() / "AppData" / "Local"
+    return base / "XiaohaCleaner" / "reports"
+
+
 def default_scan_dir(target):
-    script_dir = Path(__file__).absolute().parent
-    return script_dir / "reports" / "scan_{}_{}".format(Path(target).name, now_stamp())
+    return default_report_root() / "scan_{}_{}".format(Path(target).name, now_stamp())
 
 
 def empty_failure_plan(target, include_review=False):
@@ -1885,7 +1894,7 @@ def write_clean_setup_failure_report(
     target = Path(target).absolute()
     requested_root = Path(quarantine_root).absolute() if quarantine_root else None
     if is_root_path(target):
-        report_root = Path(__file__).absolute().parent / "reports" / "failed-clean"
+        report_root = default_report_root() / "failed-clean"
     elif (
         requested_root
         and not is_within(requested_root, target)

@@ -48,8 +48,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
-      - name: Build release archive
+          python-version: '3.11'
+      - name: Install pinned build dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+      - name: Build standalone executable and release archive
         shell: powershell
         run: |
           $version = if ('${{ github.ref_type }}' -eq 'tag') {
@@ -57,19 +60,33 @@ jobs:
           } else {
             (Get-Content .\VERSION -Raw).Trim()
           }
-          .\tools\Build-Release.ps1 -Version $version
+          $exeResult = .\tools\Build-Executable.ps1 -Version $version | ConvertFrom-Json
+          .\tools\Build-Release.ps1 -Version $version -ExecutablePath $exeResult.executable
       - name: Verify release archive
         shell: powershell
         run: |
-          $archives = @(Get-ChildItem .\dist -Filter *.zip -File)
-          $checksums = @(Get-ChildItem .\dist -Filter *.sha256 -File)
+          $archives = @(Get-ChildItem .\dist -Filter xiaoha-cleaner-*-windows.zip -File)
+          $executables = @(Get-ChildItem .\dist -Filter xiaoha-cleaner-*-windows-x64.exe -File)
+          $archiveChecksums = @(Get-ChildItem .\dist -Filter xiaoha-cleaner-*-windows.zip.sha256 -File)
+          $executableChecksums = @(Get-ChildItem .\dist -Filter xiaoha-cleaner-*-windows-x64.exe.sha256 -File)
           if ($archives.Count -ne 1) { throw "Expected one ZIP, found $($archives.Count)" }
-          if ($checksums.Count -ne 1) { throw "Expected one checksum, found $($checksums.Count)" }
-          $expected = (Get-Content $checksums[0].FullName -Raw).Split(' ')[0].Trim().ToLowerInvariant()
-          $actual = (Get-FileHash $archives[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($expected -ne $actual) { throw 'SHA-256 verification failed' }
+          if ($executables.Count -ne 1) { throw "Expected one EXE, found $($executables.Count)" }
+          if ($archiveChecksums.Count -ne 1) { throw "Expected one ZIP checksum, found $($archiveChecksums.Count)" }
+          if ($executableChecksums.Count -ne 1) { throw "Expected one EXE checksum, found $($executableChecksums.Count)" }
+          $pairs = @(
+            [pscustomobject]@{ Asset = $archives[0]; Checksum = $archiveChecksums[0] },
+            [pscustomobject]@{ Asset = $executables[0]; Checksum = $executableChecksums[0] }
+          )
+          foreach ($pair in $pairs) {
+            $expected = (Get-Content $pair.Checksum.FullName -Raw).Split(' ')[0].Trim().ToLowerInvariant()
+            $actual = (Get-FileHash $pair.Asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($expected -ne $actual) { throw "SHA-256 verification failed: $($pair.Asset.Name)" }
+            if ((Get-Content $pair.Checksum.FullName -Raw) -notmatch [regex]::Escape($pair.Asset.Name)) {
+              throw "Checksum does not bind asset filename: $($pair.Asset.Name)"
+            }
+          }
           $stage = Get-ChildItem .\dist -Directory | Select-Object -First 1
-          foreach ($file in @('xiaoha-cleaner.cmd', 'xiaoha-cleaner.py', 'README.md', 'VERSION', 'component-manifest.json')) {
+          foreach ($file in @('xiaoha-cleaner.exe', 'xiaoha-cleaner.cmd', 'xiaoha-cleaner.py', 'XiaohaCleanerGui.py', 'README.md', 'VERSION', 'component-manifest.json')) {
             if (-not (Test-Path -LiteralPath (Join-Path $stage.FullName $file) -PathType Leaf)) {
               throw "Missing release file: $file"
             }
@@ -79,10 +96,17 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $reportedVersion.Trim() -ne $expectedVersion) {
             throw "Stable CMD version mismatch: $reportedVersion"
           }
+          $exeVersion = & (Join-Path $stage.FullName 'xiaoha-cleaner.exe') --version
+          if ($LASTEXITCODE -ne 0 -or $exeVersion.Trim() -ne $expectedVersion) {
+            throw "Stable EXE version mismatch: $exeVersion"
+          }
+          & (Join-Path $stage.FullName 'xiaoha-cleaner.exe') --gui-smoke-test
+          if ($LASTEXITCODE -ne 0) { throw 'Stable EXE GUI smoke test failed' }
+          .\tests\Test-Executable.ps1 -ExecutablePath (Join-Path $stage.FullName 'xiaoha-cleaner.exe')
           $failureOutput = Join-Path $env:RUNNER_TEMP 'xiaoha-release-failed-scan'
           $oldErrorActionPreference = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
-          & (Join-Path $stage.FullName 'xiaoha-cleaner.cmd') scan (Join-Path $env:RUNNER_TEMP 'missing-xiaoha-target') --output $failureOutput *> $null
+          & (Join-Path $stage.FullName 'xiaoha-cleaner.exe') scan (Join-Path $env:RUNNER_TEMP 'missing-xiaoha-target') --output $failureOutput *> $null
           $failedScanExitCode = $LASTEXITCODE
           $ErrorActionPreference = $oldErrorActionPreference
           if ($failedScanExitCode -ne 1) {
@@ -97,6 +121,7 @@ jobs:
         with:
           name: xiaoha-cleaner-windows-${{ github.sha }}
           path: |
+            dist/*.exe
             dist/*.zip
             dist/*.sha256
           if-no-files-found: error
@@ -107,6 +132,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/*.exe
             dist/*.zip
             dist/*.sha256
           generate_release_notes: true

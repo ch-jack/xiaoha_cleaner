@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.1.0 - 2026-08-31
+
+- 产品显示名称改为“秒杀小哈”。
+- 新增 Windows x64 单文件 EXE；双击打开独立 GUI，传入参数时保持原 CLI 契约。
+- GUI 复用同一 CLI 子进程，保留只读扫描、隔离清理、数据库双重确认、报告和文件恢复边界。
+- 默认报告迁移到 `%LOCALAPPDATA%\XiaohaCleaner\reports`，不依赖源码目录或 PyInstaller 临时目录。
+- GitHub Actions 同时发布 EXE、兼容 ZIP 和各自 SHA-256，并执行 EXE GUI/CLI 冒烟验证。
+- 兼容 ZIP 保留 Python 入口并加入 EXE，支持旧工具箱回退运行。
+
 ## v1.0.1 - 2026-07-18
 
 - 为扫描、文件清理、数据库清理和恢复分别生成本次执行报告与注意事项。

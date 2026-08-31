@@ -12,7 +12,7 @@
 
 ## Release hygiene
 
-The release builder rejects server configuration files, SQL dumps, scan reports, quarantine directories, caches and local build output. GitHub Releases include a SHA-256 checksum next to every ZIP.
+The release builder rejects server configuration files, SQL dumps, scan reports, quarantine directories, caches and local build output. GitHub Releases include a filename-bound SHA-256 checksum next to every EXE and ZIP. The standalone executable does not auto-elevate and does not bundle a MySQL/MariaDB client.
 
 ## Reporting a vulnerability
 

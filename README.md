@@ -1,6 +1,6 @@
-# FiveM 小哈 / HGAdmin 完整清理工具
+# 秒杀小哈
 
-用于扫描并移除 FiveM 服务器中的小哈/HGAdmin 资源、自动注入守卫、启动配置引用和数据库对象。工具基于 raw dumper 与 decrypted 样本建立识别规则，并内置从 decrypted 样本确认的数据库表清单。
+用于扫描并移除 FiveM 服务器中的小哈/HGAdmin 资源、自动注入守卫、启动配置引用和数据库对象。双击独立 EXE 可直接打开图形界面，也保留完整命令行接口供 CK 免费工具箱和自动化任务调用。工具基于 raw dumper 与 decrypted 样本建立识别规则，并内置从 decrypted 样本确认的数据库表清单。
 
 ## 主要能力
 
@@ -18,31 +18,35 @@
 
 从仓库的 [Releases](https://github.com/ch-jack/xiaoha_cleaner/releases) 下载：
 
+- `xiaoha-cleaner-vX.Y.Z-windows-x64.exe`
+- `xiaoha-cleaner-vX.Y.Z-windows-x64.exe.sha256`
 - `xiaoha-cleaner-vX.Y.Z-windows.zip`
 - `xiaoha-cleaner-vX.Y.Z-windows.zip.sha256`
 
-解压后运行 `xiaoha-cleaner.cmd`。需要 Windows 和 Python 3.7+；只有执行数据库清理时才需要 MySQL/MariaDB 命令行客户端。
+普通用户直接运行 EXE，不需要安装 Python。兼容包解压后也可运行 `xiaoha-cleaner.exe`；源码入口 `xiaoha-cleaner.cmd` 仍需要 Python 3.7+。只有执行数据库清理时才需要 MySQL/MariaDB 命令行客户端。
 
 ## 使用
 
-先停止 FiveM 服务器。涉及数据库删除时，必须先备份数据库。
+双击 `xiaoha-cleaner.exe` 会打开“秒杀小哈”图形界面。先停止 FiveM 服务器；涉及数据库删除时，必须先备份数据库。
+
+EXE 同时保留稳定 CLI：
 
 ```powershell
 # 只读扫描，不修改文件、不连接数据库
-.\xiaoha-cleaner.cmd scan "D:\server-data"
+.\xiaoha-cleaner.exe scan "D:\server-data"
 
 # 隔离资源、清理注入和配置引用，仅生成数据库 SQL
-.\xiaoha-cleaner.cmd clean "D:\server-data" --yes
+.\xiaoha-cleaner.exe clean "D:\server-data" --yes
 
 # 同时从 server.cfg 自动读取 MySQL，并执行删表/删列
-.\xiaoha-cleaner.cmd clean "D:\server-data" --yes `
+.\xiaoha-cleaner.exe clean "D:\server-data" --yes `
   --apply-sql --yes-drop-tables
 ```
 
 如果目标目录下存在多个 txAdmin profile，并且连接到不同数据库，工具会拒绝自动选择。此时明确指定配置：
 
 ```powershell
-.\xiaoha-cleaner.cmd clean "D:\txData" --yes `
+.\xiaoha-cleaner.exe clean "D:\txData" --yes `
   --apply-sql --yes-drop-tables `
   --server-cfg "D:\txData\default\server.cfg"
 ```
@@ -111,7 +115,7 @@ warns
 清理会在目标目录外创建 `_xiaoha_quarantine`，其中包含原资源、注入文件、被编辑文件备份和运行报告：
 
 ```powershell
-.\xiaoha-cleaner.cmd restore `
+.\xiaoha-cleaner.exe restore `
   "D:\_xiaoha_quarantine\server-data_YYYYMMDD_HHMMSS\run-report.json" `
   --yes
 ```
@@ -132,7 +136,9 @@ warns
 ```powershell
 python -m py_compile *.py
 python -m unittest discover -s tests -v
-.\tools\Build-Release.ps1 -Version v1.0.1
+python -m pip install -r requirements-build.txt
+$exe = .\tools\Build-Executable.ps1 -Version v1.1.0 | ConvertFrom-Json
+.\tools\Build-Release.ps1 -Version v1.1.0 -ExecutablePath $exe.executable
 ```
 
-推送 `v*` 标签后，GitHub Actions 会运行 Python 3.7/3.8/3.12 测试，验证稳定 CMD 的版本与失败退出码，生成版本化 ZIP 和 SHA-256，并自动创建 GitHub Release。
+推送 `v*` 标签后，GitHub Actions 会运行 Python 3.7/3.8/3.12 测试，以固定版本 PyInstaller 生成 Windows x64 单文件 EXE，验证 GUI、CLI、失败报告和 SHA-256，再发布 EXE、兼容 ZIP 及各自校验文件。
